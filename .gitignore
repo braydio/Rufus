@@ -1,4 +1,27 @@
+# Ignore cache directories
+__pycache__/
+
+# Ignore model files
+models/quantized/*.gguf
+
+# Ignore model manager JSON cache
+model_cache.json
+
+# Ignore Python bytecode
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore IDEs or editor-specific files
+.idea/
+.vscode/
+*.swp
+*~ 
+
+# Ignore environment files
 .env
-.venv/*
+.venv/
+venv/
+env/
+
 .local
-fastcat.txt
