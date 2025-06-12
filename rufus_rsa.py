@@ -16,6 +16,7 @@ from collections import defaultdict
 from rsa.session_tracker import RSASessionManager
 from rsa.watchlist_manager import RufusWatchlistManager
 from prompt_setup import SYSTEM_PROMPT, REFORMAT_PROMPT, SUMMARY_PROMPT
+from websearch_adapter import query_with_websearch
 
 # Load environment variables
 load_dotenv()
@@ -265,7 +266,11 @@ async def on_message(message):
         for msg in summaries:
             await message.channel.send(f"📊 {msg}")
         return
-
+    if content.startswith("!web "):
+        user_query = message.content[5:].strip()
+        response = await query_with_websearch(user_query)
+        await message.channel.send(response)
+        return
     # Regex-based split date watchlist add
     if "split date" in content and "watchlist" in content:
         match = re.search(
