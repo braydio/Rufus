@@ -1,3 +1,4 @@
+# rufus_rsa.py
 import discord
 import os
 import logging
@@ -9,9 +10,7 @@ import time
 import traceback
 import schedule
 import threading
-import json
 from dotenv import load_dotenv
-from collections import defaultdict
 
 from rsa.session_tracker import RSASessionManager
 from rsa.watchlist_manager import RufusWatchlistManager
@@ -21,9 +20,15 @@ from prompt_setup import SYSTEM_PROMPT, REFORMAT_PROMPT, SUMMARY_PROMPT
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 AI_API_URL = os.getenv("API_URL", "http://localhost:5051/v1/chat/completions")
-TARGET_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID"))
+TARGET_CHANNEL_ID = os.getenv("ANNOUNCE_CHANNEL_ID")
+SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "system_prompt.txt")
+REFORMAT_PROMPT_FILE = os.getenv("REFORMAT_PROMPT_FILE", "reformat_prompt.txt")
+SUMMARY_PROMPT_FILE = os.getenv("SUMMARY_PROMPT_FILE", "summary_prompt.txt")
+
+
 LOG_TO_FILE = os.getenv("LOG_TO_FILE", "false").lower() == "true"
 LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "chat_logs.txt")
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,123 +37,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RufusBot")
 
+# Discord setup
 intents = discord.Intents.default()
 intents.message_content = True
 bot = discord.Client(intents=intents)
 
+# RSA session tracker
 rsa_tracker = RSASessionManager()
 rwatch = RufusWatchlistManager()
 
-memory_buffer = defaultdict(list)  # per-user buffer
+# Memory buffer (for conversation history)
+
+memory_buffer = defaultdict(list)  # key = user_id or channel_id
 active_trades = {}
 MAX_MEMORY_LENGTH = 40
 MAX_DISCORD_LENGTH = 2000
 
 
-async def update_lifecycle_from_ai(
-    user_id, rsa_tracker, rwatch, ai_client, discord_channel, chunk_size=10
-):
-    chunks = rsa_tracker.get_message_chunks(user_id, chunk_size=chunk_size)
-    watchlist_summary = rwatch.get_all_statuses()
-    ticker_list = list(rwatch.watchlist.keys())
-
-    for idx, chunk in enumerate(chunks):
-        raw_messages = "\n".join([msg["content"] for msg in chunk])
-        prompt = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an assistant helping manage broker positions "
-                    "on a stock watchlist. A stock goes through lifecycle stages: "
-                    "`planned`, `holding`, `awaiting_sell`, `closed`."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Watchlist:\n{', '.join(ticker_list)}\n\n"
-                    f"Split dates and broker status:\n"
-                    + "\n".join(watchlist_summary)
-                    + f"\n\nHere are recent broker activity logs:\n{raw_messages}\n\n"
-                    "Based on these messages, tell me for each stock which brokers "
-                    "have entered a new lifecycle stage (like just purchased, or just sold). "
-                    "Return JSON like:\n"
-                    "{ 'FRGT': { 'BBAE': { '1': { 'status': 'holding', 'account': '4365' } } } }"
-                ),
-            },
-        ]
-
-        try:
-            await discord_channel.send(
-                "📤 Sending the following messages to AI:\n" + raw_messages[:1800]
-            )
-            response = await ai_client(prompt)
-            lifecycle_updates = json.loads(response)
-
-            for ticker, broker_data in lifecycle_updates.items():
-                for broker, accounts in broker_data.items():
-                    for broker_number, info in accounts.items():
-                        new_status = info.get("status")
-                        account = info.get("account")
-                        prev = rwatch.get_broker_state(ticker, broker, broker_number)
-                        prev_status = prev.get("status")
-
-                        rwatch.update_lifecycle(
-                            ticker=ticker,
-                            broker=broker,
-                            broker_number=broker_number,
-                            status=new_status,
-                            account=account,
-                        )
-
-                        # Notify only on status transition
-                        if (
-                            new_status == "awaiting_sell"
-                            and prev_status != "awaiting_sell"
-                        ):
-                            await discord_channel.send(
-                                f"🔔 `{broker} {broker_number}` is now `awaiting_sell` for `{ticker}`.\n"
-                                f"Please check account `{account}` for return of stock after split."
-                            )
-                        elif new_status == "closed" and prev_status != "closed":
-                            await discord_channel.send(
-                                f"✅ `{broker} {broker_number}` has closed out `{ticker}`."
-                            )
-
-        except Exception as e:
-            await discord_channel.send(f"❌ Failed to process lifecycle update: {e}")
-
-
 async def post_daily_summary():
     summaries = rwatch.log_and_get_summary()
-    channel = bot.get_channel(TARGET_CHANNEL_ID)
+    channel = bot.get_channel(int(TARGET_CHANNEL_ID))
     if channel:
         for msg in summaries:
             await channel.send(f"📊 {msg}")
-
-
-def sync_purchases_from_lifecycle(self):
-    """Ensure that accounts marked as 'holding' are also registered in 'purchases' list (legacy support)."""
-    for ticker, ticker_data in self.watchlist.items():
-        brokers = ticker_data.get("brokers", {})
-        purchases = set(ticker_data.get("purchases", []))  # legacy style
-        updated = False
-
-        for broker, broker_accounts in brokers.items():
-            for number, info in broker_accounts.items():
-                if info.get("status") == "holding":
-                    acct_str = f"{broker}:{number}"
-                    if acct_str not in purchases:
-                        self.watchlist[ticker].setdefault("purchases", []).append(
-                            acct_str
-                        )
-                        updated = True
-                        logger.info(
-                            f"🔄 Synced purchase from lifecycle → {acct_str} for {ticker}"
-                        )
-
-        if updated:
-            self.save()
 
 
 def schedule_loop(loop):
@@ -163,6 +74,7 @@ def schedule_loop(loop):
         time.sleep(60)
 
 
+# Utility logging
 def log_to_file(user, prompt, response, note=None):
     if LOG_TO_FILE:
         with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
@@ -174,7 +86,6 @@ def log_to_file(user, prompt, response, note=None):
 
 async def query_chat_completion(messages):
     payload = {
-        "model": "gpt-4",
         "messages": messages,
         "temperature": 0.7,
         "max_tokens": 600,
@@ -195,7 +106,6 @@ async def query_chat_completion(messages):
 
 async def reformat_query(user_input):
     payload = {
-        "model": "gpt-4",
         "messages": [
             {"role": "system", "content": REFORMAT_PROMPT},
             {"role": "user", "content": user_input},
@@ -222,28 +132,24 @@ async def reformat_query(user_input):
 @bot.event
 async def on_ready():
     logger.info(f"✅ Logged in as {bot.user}")
-    loop = asyncio.get_event_loop()
-    threading.Thread(target=schedule_loop, args=(loop,), daemon=True).start()
-
+    await asyncio.sleep(1)
     channel = bot.get_channel(TARGET_CHANNEL_ID)
     if channel:
+        logger.info(f"Confirmed channel as {TARGET_CHANNEL_ID}")
         await channel.send(
             "🤖 Rufus is online and ready to go! Type `..ai` to ask me anything."
         )
+        logger.info(f"📣 Announced ready in #{channel.name}")
 
 
 @bot.event
 async def on_message(message):
-    # These are commented out because they filtered out the messages
-    # That I was trying to record, sent from other bots in other channel.
-    #
-    # if message.author.bot or message.channel.id != TARGET_CHANNEL_ID:
-    #     return
+    global memory_buffer
 
     content = message.content.lower()
-    user_id = message.author.id
     logger.info(f"📩 New message received: {message.content[:80]}")
 
+<<<<<<<< HEAD:extra/rufus_surfer.py
     full_text = message.content
     for embed in message.embeds:
         if embed.description:
@@ -267,28 +173,87 @@ async def on_message(message):
         or content.startswith("..all")
     ):
         rwatch.sync_purchases_from_lifecycle()
+========
+    if content.startswith("..summary"):
+        logger.info("📝 Manual summary request triggered.")
+>>>>>>>> 6cf1bcb (Commit all changes):rufus_rsa.py
         summaries = rwatch.log_and_get_summary()
         for msg in summaries:
             await message.channel.send(f"📊 {msg}")
         return
 
+<<<<<<<< HEAD:extra/rufus_surfer.py
     # Regex-based split date watchlist add
+========
+>>>>>>>> 6cf1bcb (Commit all changes):rufus_rsa.py
     if "split date" in content and "watchlist" in content:
+        logger.info("🔍 Attempting to parse split date from watchlist message.")
         match = re.search(
             r"\*\*\|\s*([A-Z]+)\*\*.*?(\d{4}-\d{2}-\d{2})", message.content
         )
         if match:
             ticker, split_date = match.group(1), match.group(2)
-            if rwatch.add(ticker, split_date):
+            added = rwatch.add(ticker, split_date)
+            logger.info(
+                f"👁️ Added to watchlist: {ticker} | Split date: {split_date} | New: {added}"
+            )
+            if added:
                 await message.channel.send(
                     f"👀 Tracking `{ticker}` for {split_date} split."
                 )
         return
 
-    # RSA session start
+    match = re.match(r"!rsa (buy|sell) (\d+)? ?([A-Z]+)", content)
+    if match:
+        action, qty, ticker = match.groups()
+        ticker = ticker.upper()
+        active_trades[ticker] = True
+        logger.info(f"🟢 {action.upper()} activity initiated for {ticker}")
+        await message.channel.send(f"🟢 Monitoring broker fills for `{ticker}`.")
+        return
+
+    buy_match = re.search(r"(\w+)\s+(\d): buying .* of ([A-Z]+)", content)
+    if buy_match:
+        broker, acct, ticker = buy_match.groups()
+        ticker = ticker.upper()
+        acct_id = f"{broker}:{acct}"
+        if ticker in active_trades:
+            rwatch.mark_purchase(ticker, acct_id)
+            logger.info(f"💸 Purchase logged: {ticker} | Account: {acct_id}")
+        return
+
+    match = re.match(r"all (\w+) transactions complete", content)
+    if match:
+        broker = match.group(1)
+        to_remove = []
+        logger.info(f"🔴 Processing transaction completion for broker: {broker}")
+        for ticker in list(active_trades):
+            for acct in rwatch.watchlist.get(ticker, {}).get("purchases", []):
+                if acct.lower().startswith(broker.lower()):
+                    rwatch.mark_closeout(ticker, acct)
+                    logger.info(f"✅ Closeout recorded: {ticker} | Account: {acct}")
+            to_remove.append(ticker)
+        for ticker in to_remove:
+            del active_trades[ticker]
+        await message.channel.send(f"✅ Closeout activity logged for `{ticker}`.")
+        return
+
+    if content.startswith("..status"):
+        logger.info("📥 Status command received.")
+        parts = content.split()
+        if len(parts) >= 2:
+            ticker = parts[1]
+            summary = rwatch.get_status(ticker)
+            logger.info(f"📊 Status for {ticker} retrieved.")
+            await message.channel.send(summary)
+        else:
+            await message.channel.send("Usage: `..status TICKER`")
+        return
+
     if content.startswith("!rsa"):
+        logger.info("🔧 RSA session tracking command received.")
         rsa_tracker.start_session(
-            user_id,
+            message.author.id,
             expected_brokers=[
                 "bbae",
                 "dspac",
@@ -300,116 +265,41 @@ async def on_message(message):
                 "webull",
             ],
         )
-        await message.channel.send("📍 Tracking this RSA session.")
-        return
-
-    # Broker buy activity → update lifecycle to 'holding'
-    if match := re.search(r"(\w+)\s+(\d): buying .* of ([A-Z]+)", content):
-        broker, acct, ticker = match.groups()
-        ticker = ticker.upper()
-        if ticker in active_trades:
-            rwatch.update_lifecycle(
-                ticker=ticker,
-                broker=broker,
-                broker_number=acct,
-                status="holding",
-                account=f"{broker}:{acct}",
-            )
-        return
-
-    # Track "!rsa buy 1 XYZ" to trigger trade tracking
-    if match := re.match(r"!rsa (buy|sell) (\d+)? ?([A-Z]+)", content):
-        action, qty, ticker = match.groups()
-        ticker = ticker.upper()
-        active_trades[ticker] = True
-        await message.channel.send(f"🟢 Monitoring broker fills for `{ticker}`.")
-        return
-
-    # Handle broker closeout (by broker group)
-    if match := re.match(r"all (\w+) transactions complete", content):
-        broker = match.group(1)
-        rsa_tracker.mark_broker_complete(user_id, broker)
-        for ticker in list(active_trades):
-            rwatch.update_lifecycle(
-                ticker=ticker, broker=broker, broker_number="?", status="closed"
-            )
-            del active_trades[ticker]
-        await message.channel.send(f"✅ Closeout activity logged for `{ticker}`.")
-        return
-
-    # Handle final completion + AI lifecycle update
-    if "all commands complete in all brokers" in content:
-        rsa_tracker.mark_all_done(user_id)
-        summary = rsa_tracker.get_status(user_id)
-        await message.channel.send(f"📊 RSA session summary:\n```\n{summary}\n```")
-        await update_lifecycle_from_ai(
-            user_id=user_id,
-            rsa_tracker=rsa_tracker,
-            rwatch=rwatch,
-            ai_client=query_chat_completion,
-            discord_channel=message.channel,
-        )
-        return
-
-    # Broker error parsing
-    if err_match := re.search(r"(?:error.*order.*(?:for|on)) (\w+)", content):
-        rsa_tracker.mark_error(user_id, err_match.group(1), message.content)
-        return
-
-    if content.startswith("..lifecycle"):
-        parts = content.split()
-        if len(parts) < 2:
-            await message.channel.send("Usage: `..lifecycle TICKER`")
-            return
-
-        ticker = parts[1].upper()
-        data = rwatch.watchlist.get(ticker)
-        if not data:
-            await message.channel.send(f"⚠️ `{ticker}` is not on the watchlist.")
-            return
-
-        split_date = data.get("split_date", "???")
-        brokers = data.get("brokers", {})
-        today = datetime.today().date()
-        passed = (
-            "✅ passed"
-            if today >= datetime.strptime(split_date, "%Y-%m-%d").date()
-            else "⏳ upcoming"
-        )
-
-        msg = f"📋 Lifecycle state for **{ticker}** (split {split_date}, {passed}):\n"
-
-        for broker, accounts in brokers.items():
-            for num, info in accounts.items():
-                state = info.get("status", "unknown")
-                acct = info.get("account", "???")
-                last = info.get("last_seen", "unknown")
-                msg += f"  • {broker} {num} [{acct}] → `{state}` (last seen {last})\n"
-
-        await message.channel.send(msg)
-        return
-
-    # Dump session log (debug)
-    if content.startswith("..sessiondump"):
-        session = rsa_tracker.get_session_dump(user_id)
-        if not session:
-            await message.channel.send("⚠️ No session found for your user.")
-            return
-        logs = session.get("messages", [])
-        output = "\n".join(f"- {msg['content']}" for msg in logs[-10:]) or "(empty)"
         await message.channel.send(
-            f"🧾 Last 10 messages in session:\n```\n{output}\n```"
+            "📍 Tracking this RSA session. I'll notify you if any brokers are missed."
         )
         return
 
-    # Skip if not an AI query
-    if not message.content.startswith("..ai"):
+    match = re.match(r"all (\w+) transactions complete", content)
+    if match:
+        rsa_tracker.mark_broker_complete(message.author.id, match.group(1))
+        logger.info(f"✅ Broker marked complete: {match.group(1)}")
         return
 
-    # 🧠 AI handling with memory and summarization
+    if "all commands complete in all brokers" in content:
+        rsa_tracker.mark_all_done(message.author.id)
+        summary = rsa_tracker.get_status(message.author.id)
+        logger.info("📦 All broker commands complete. Summary sent.")
+        await message.channel.send(f"📊 RSA session summary:\n```\n{summary}\n```")
+        return
+
+    err_match = re.search(r"(?:error.*order.*(?:for|on)) (\w+)", content)
+    if err_match:
+        rsa_tracker.mark_error(message.author.id, err_match.group(1), message.content)
+        logger.warning(f"⚠️ Error logged for broker: {err_match.group(1)}")
+        return
+
+    if message.channel.id != TARGET_CHANNEL_ID or not message.content.startswith(
+        "..ai"
+    ):
+        return
+
+    logger.info(f"🟡 AI query received from {message.author.display_name}")
+    thinking_task = None
+
     async def thinking_loop(channel):
         idx = 0
-        thoughts = [
+        thinking_messages = [
             "Heh...",
             "Well erm...",
             "Okay so...",
@@ -417,35 +307,47 @@ async def on_message(message):
             "Uhh...",
             "Thinking...",
         ]
-        msg = await channel.send(thoughts[0])
+        msg = await channel.send(thinking_messages[0])
         try:
             while True:
                 await asyncio.sleep(5)
                 idx += 1
-                await msg.edit(content=thoughts[idx % len(thoughts)])
+                await msg.edit(content=thinking_messages[idx % len(thinking_messages)])
         except asyncio.CancelledError:
             try:
                 await msg.delete()
             except:
                 pass
 
-    thinking_task = asyncio.create_task(thinking_loop(message.channel))
     try:
+        thinking_task = asyncio.create_task(thinking_loop(message.channel))
         raw_query = message.content[len("..ai") :].strip()
         reformatted_query = await reformat_query(raw_query)
 
         chat_messages = (
             [{"role": "system", "content": SYSTEM_PROMPT}]
+<<<<<<<< HEAD:extra/rufus_surfer.py
             + memory_buffer[user_id]
             + [{"role": "user", "content": reformatted_query}]
+========
+            + memory_buffer
+            + [
+                {
+                    "role": "user",
+                    "content": f"{message.author.display_name}: {reformatted_query}",
+                }
+            ]
+>>>>>>>> 6cf1bcb (Commit all changes):rufus_rsa.py
         )
+
         response = await query_chat_completion(chat_messages)
 
-        thinking_task.cancel()
-        try:
-            await thinking_task
-        except:
-            pass
+        if thinking_task:
+            thinking_task.cancel()
+            try:
+                await thinking_task
+            except:
+                pass
 
         if len(response) > MAX_DISCORD_LENGTH:
             for i in range(0, len(response), MAX_DISCORD_LENGTH):
@@ -467,26 +369,33 @@ async def on_message(message):
             ]
             summarized_response = await query_chat_completion(summary_prompt)
 
-            memory_buffer[user_id].append({"role": "user", "content": raw_query})
-            memory_buffer[user_id].append(
-                {"role": "assistant", "content": summarized_response}
+            memory_buffer.append(
+                {
+                    "role": "user",
+                    "content": f"{message.author.display_name}: {raw_query}",
+                }
+            )
+            memory_buffer.append(
+                {"role": "assistant", "content": f"Rufus: {summarized_response}"}
             )
 
-            if len(memory_buffer[user_id]) > MAX_MEMORY_LENGTH:
-                memory_buffer[user_id] = memory_buffer[user_id][-MAX_MEMORY_LENGTH:]
+            if len(memory_buffer) > MAX_MEMORY_LENGTH:
+                memory_buffer = memory_buffer[-MAX_MEMORY_LENGTH:]
 
             log_to_file(
                 "SYSTEM", "Summary Prompt", summarized_response, note="Memory Summary"
             )
+
     except Exception as e:
         logger.error(f"❌ Error in on_message: {e}")
 
 
 if __name__ == "__main__":
     try:
+        bot.run(TOKEN)
+    except Exception as e:
         loop = asyncio.get_event_loop()
         threading.Thread(target=schedule_loop, args=(loop,), daemon=True).start()
-        bot.run(TOKEN)
-    except Exception:
+
         print("❌ Bot startup error:")
         print(traceback.format_exc())
