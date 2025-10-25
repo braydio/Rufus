@@ -1,0 +1,13 @@
+
+# GPU
+docker run --gpus all -p 8080:8080 --rm \
+  ghcr.io/huggingface/text-generation-inference:latest \
+  --model-id <your‑model‑name> \
+  --trust-remote-code
+
+# CPU (slower!)
+docker run -p 8080:8080 --rm \
+  ghcr.io/huggingface/text-generation-inference:latest \
+  --model-id huggyllama/llama-7b \
+  --no-half \
+  --trust-remote-code \

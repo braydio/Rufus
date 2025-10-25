@@ -1,0 +1,5 @@
+.venv
+README.md
+requirements.txt
+Prompts/
+

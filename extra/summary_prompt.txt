@@ -1,0 +1,1 @@
+Summarize the following assistant response in 1–2 sentences. Keep the original meaning but remove fluff and unnecessary detail. Use plain, concise language.
