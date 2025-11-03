@@ -7,8 +7,10 @@ maintainability and clarity rather than feature bloat.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import shlex
 from collections import deque
 from typing import Deque, Dict, List
 
@@ -22,6 +24,13 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_URL = os.getenv("API_URL", "http://localhost:5051/v1/chat/completions")
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "..ai")
+MINECRAFT_COMMAND = os.getenv("MINECRAFT_COMMAND", "..startmc")
+MINECRAFT_SCRIPT = os.path.expanduser(
+    os.getenv(
+        "MINECRAFT_SCRIPT",
+        "/home/braydenchaffee/Media/Minecraft/MinecraftReloaded/run.sh",
+    )
+)
 MAX_DISCORD_MESSAGE = 1900
 MAX_HISTORY = 6
 
@@ -88,7 +97,14 @@ class RufusBot(discord.Client):
         _logger.info("Logged in as %s", self.user)
 
     async def on_message(self, message: Message) -> None:  # pragma: no cover - Discord callback
-        if message.author == self.user or not message.content.startswith(COMMAND_PREFIX):
+        if message.author == self.user:
+            return
+
+        if message.content.startswith(MINECRAFT_COMMAND):
+            await self._handle_minecraft_launch(message)
+            return
+
+        if not message.content.startswith(COMMAND_PREFIX):
             return
 
         user_prompt = message.content[len(COMMAND_PREFIX) :].strip()
@@ -119,6 +135,27 @@ class RufusBot(discord.Client):
             await message.channel.send(chunk)
 
 
+    async def _handle_minecraft_launch(self, message: Message) -> None:
+        """Launch the configured Minecraft server script and report the result."""
+
+        await message.channel.send(
+            "Waxing the board and starting the Minecraft server... hang tight! 🏄"
+        )
+
+        try:
+            await _launch_minecraft_server()
+        except Exception as exc:  # pragma: no cover - system-level failure path
+            _logger.exception("Minecraft server launch failed")
+            await message.channel.send(
+                f"The server launch bailed with an error: `{exc}`."
+            )
+            return
+
+        await message.channel.send(
+            "Minecraft server launch command sent! Grab your gear and hop in. 🎮"
+        )
+
+
 def _chunk_message(text: str) -> List[str]:
     """Split a long response into Discord-safe chunks."""
 
@@ -139,6 +176,32 @@ def main() -> None:  # pragma: no cover - CLI entry
 
     client = RufusBot()
     client.run(BOT_TOKEN)
+
+
+async def _launch_minecraft_server() -> None:
+    """Spawn the Minecraft server script in the background."""
+
+    if not os.path.exists(MINECRAFT_SCRIPT):
+        raise RuntimeError(
+            f"Launch script not found at {MINECRAFT_SCRIPT}."
+        )
+
+    command = f"nohup {shlex.quote(MINECRAFT_SCRIPT)} >/dev/null 2>&1 &"
+
+    process = await asyncio.create_subprocess_exec(
+        "/bin/bash",
+        "-c",
+        command,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stderr_data = await process.stderr.read()
+    return_code = await process.wait()
+
+    if return_code != 0:
+        stderr_text = stderr_data.decode().strip() or "Unknown error launching server"
+        raise RuntimeError(stderr_text)
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry
     main()
