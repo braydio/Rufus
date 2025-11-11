@@ -32,7 +32,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_URL = os.getenv("API_URL", "http://localhost:5051/v1/chat/completions")
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "..ai")
 MINECRAFT_COMMAND = os.getenv("MINECRAFT_COMMAND", "..startmc")
-
+DISCORD_LOG_CHANNEL_ID = os.getenv(
+    "DISCORD_LOG_CHANNEL_ID",
+)
 MINECRAFT_SCRIPT = os.path.expanduser(
     os.getenv(
         "MINECRAFT_SCRIPT",
@@ -546,9 +548,7 @@ async def _launch_minecraft_server(script_path: str) -> None:
     """Spawn the provided Minecraft server script in the background."""
 
     if not os.path.exists(script_path):
-        raise RuntimeError(
-            f"Launch script not found at {script_path}."
-        )
+        raise RuntimeError(f"Launch script not found at {script_path}.")
 
     command = f"nohup {shlex.quote(script_path)} >/dev/null 2>&1 &"
 
@@ -647,7 +647,9 @@ async def _get_ngrok_tunnels() -> List[str]:
         return []
 
     tunnels = data.get("tunnels", [])
-    return [tunnel.get("public_url", "") for tunnel in tunnels if tunnel.get("public_url")]
+    return [
+        tunnel.get("public_url", "") for tunnel in tunnels if tunnel.get("public_url")
+    ]
 
 
 async def _get_lan_ip() -> Optional[str]:
@@ -676,9 +678,7 @@ def _format_server_status(status: ServerStatus) -> str:
         else "⛔ Main server is stopped"
     )
     alt_line = (
-        "✅ Alt server is running"
-        if status.alt_running
-        else "⛔ Alt server is stopped"
+        "✅ Alt server is running" if status.alt_running else "⛔ Alt server is stopped"
     )
 
     lines = [
@@ -716,6 +716,7 @@ def _parse_stopserver_target(message_content: str, command: str) -> str:
         return "alt"
 
     return "auto"
+
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry
     main()
