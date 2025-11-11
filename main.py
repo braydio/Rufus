@@ -11,8 +11,10 @@ import asyncio
 import logging
 import os
 import shlex
+import socket
 from collections import deque
-from typing import Deque, Dict, List
+from dataclasses import dataclass
+from typing import Deque, Dict, List, Optional, Sequence
 
 import aiohttp
 import discord
@@ -31,6 +33,15 @@ MINECRAFT_SCRIPT = os.path.expanduser(
         "/home/braydenchaffee/Media/Minecraft/MinecraftReloaded/run.sh",
     )
 )
+MINECRAFT_ALT_SCRIPT = os.path.expanduser(
+    os.getenv(
+        "MINECRAFT_ALT_SCRIPT",
+        "/home/braydenchaffee/Media/Minecraft/Opticraft_VR/run.sh",
+    )
+)
+SERVER_STATUS_COMMAND = os.getenv("SERVER_STATUS_COMMAND", "..serverstatus")
+STOP_SERVER_COMMAND = os.getenv("STOP_SERVER_COMMAND", "..stopserver")
+MINECRAFT_PORT = os.getenv("MINECRAFT_PORT", "25565")
 MAX_DISCORD_MESSAGE = 1900
 MAX_HISTORY = 6
 
@@ -104,6 +115,14 @@ class RufusBot(discord.Client):
             await self._handle_minecraft_launch(message)
             return
 
+        if message.content.startswith(SERVER_STATUS_COMMAND):
+            await self._handle_server_status(message)
+            return
+
+        if message.content.startswith(STOP_SERVER_COMMAND):
+            await self._handle_stop_server(message)
+            return
+
         if not message.content.startswith(COMMAND_PREFIX):
             return
 
@@ -136,14 +155,41 @@ class RufusBot(discord.Client):
 
 
     async def _handle_minecraft_launch(self, message: Message) -> None:
-        """Launch the configured Minecraft server script and report the result."""
+        """Launch the main Minecraft server, shutting down the alt server if needed."""
 
         await message.channel.send(
             "Waxing the board and starting the Minecraft server... hang tight! 🏄"
         )
 
         try:
-            await _launch_minecraft_server()
+            alt_running = await _is_server_running(MINECRAFT_ALT_SCRIPT)
+        except Exception as exc:  # pragma: no cover - system-level failure path
+            _logger.exception("Failed to determine alt server status")
+            await message.channel.send(
+                f"Couldn't check the alt server status: `{exc}`."
+            )
+            return
+
+        if alt_running:
+            await message.channel.send(
+                "Alt server is up — letting the crew know and shutting it down before launching the main server."
+            )
+            try:
+                alt_stopped = await _stop_server(MINECRAFT_ALT_SCRIPT)
+            except Exception as exc:  # pragma: no cover - system-level failure path
+                _logger.exception("Failed to stop alt server")
+                await message.channel.send(
+                    f"Tried to stop the alt server but wiped out with: `{exc}`."
+                )
+                return
+
+            if not alt_stopped:
+                await message.channel.send(
+                    "Couldn't find a running alt server after all, so moving ahead with the main launch."
+                )
+
+        try:
+            await _launch_minecraft_server(MINECRAFT_SCRIPT)
         except Exception as exc:  # pragma: no cover - system-level failure path
             _logger.exception("Minecraft server launch failed")
             await message.channel.send(
@@ -152,8 +198,55 @@ class RufusBot(discord.Client):
             return
 
         await message.channel.send(
-            "Minecraft server launch command sent! Grab your gear and hop in. 🎮"
+            "Main Minecraft server launch command sent! Grab your gear and hop in. 🎮"
         )
+
+    async def _handle_server_status(self, message: Message) -> None:
+        """Report which Minecraft servers are active along with tunnel info."""
+
+        async with message.channel.typing():
+            status = await _collect_server_status()
+
+        await message.channel.send(_format_server_status(status))
+
+    async def _handle_stop_server(self, message: Message) -> None:
+        """Stop the requested Minecraft server."""
+
+        target = _parse_stopserver_target(message.content, STOP_SERVER_COMMAND)
+
+        async with message.channel.typing():
+            status = await _collect_server_status()
+
+            if target == "auto":
+                if status.alt_running:
+                    target = "alt"
+                elif status.main_running:
+                    target = "main"
+                else:
+                    await message.channel.send(
+                        "No Minecraft servers are running right now — nothing to stop."
+                    )
+                    return
+
+            script = MINECRAFT_SCRIPT if target == "main" else MINECRAFT_ALT_SCRIPT
+
+            try:
+                stopped = await _stop_server(script)
+            except Exception as exc:  # pragma: no cover - system-level failure path
+                _logger.exception("Failed to stop requested server")
+                await message.channel.send(
+                    f"Tried to stop the {target} server but ran into trouble: `{exc}`."
+                )
+                return
+
+        if stopped:
+            await message.channel.send(
+                f"The {target} server received the stop command. Give it a moment to wind down."
+            )
+        else:
+            await message.channel.send(
+                f"Didn't spot an active process for the {target} server. It may already be offline."
+            )
 
 
 def _chunk_message(text: str) -> List[str]:
@@ -178,15 +271,25 @@ def main() -> None:  # pragma: no cover - CLI entry
     client.run(BOT_TOKEN)
 
 
-async def _launch_minecraft_server() -> None:
-    """Spawn the Minecraft server script in the background."""
+@dataclass(frozen=True)
+class ServerStatus:
+    """Container describing the current Minecraft server environment."""
 
-    if not os.path.exists(MINECRAFT_SCRIPT):
+    main_running: bool
+    alt_running: bool
+    ngrok_urls: Sequence[str]
+    lan_ip: Optional[str]
+
+
+async def _launch_minecraft_server(script_path: str) -> None:
+    """Spawn the provided Minecraft server script in the background."""
+
+    if not os.path.exists(script_path):
         raise RuntimeError(
-            f"Launch script not found at {MINECRAFT_SCRIPT}."
+            f"Launch script not found at {script_path}."
         )
 
-    command = f"nohup {shlex.quote(MINECRAFT_SCRIPT)} >/dev/null 2>&1 &"
+    command = f"nohup {shlex.quote(script_path)} >/dev/null 2>&1 &"
 
     process = await asyncio.create_subprocess_exec(
         "/bin/bash",
@@ -202,6 +305,156 @@ async def _launch_minecraft_server() -> None:
     if return_code != 0:
         stderr_text = stderr_data.decode().strip() or "Unknown error launching server"
         raise RuntimeError(stderr_text)
+
+
+async def _is_server_running(script_path: str) -> bool:
+    """Determine whether a process matching the script path is running."""
+
+    if not script_path:
+        return False
+
+    process = await asyncio.create_subprocess_exec(
+        "pgrep",
+        "-f",
+        script_path,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+    return await process.wait() == 0
+
+
+async def _stop_server(script_path: str) -> bool:
+    """Attempt to stop the server whose processes reference the script path."""
+
+    if not os.path.exists(script_path):
+        raise RuntimeError(f"Launch script not found at {script_path}.")
+
+    process = await asyncio.create_subprocess_exec(
+        "pkill",
+        "-f",
+        script_path,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stderr_data = await process.stderr.read()
+    return_code = await process.wait()
+
+    if return_code == 0:
+        return True
+
+    if return_code == 1:
+        return False
+
+    stderr_text = stderr_data.decode().strip() or "Unknown error stopping server"
+    raise RuntimeError(stderr_text)
+
+
+async def _collect_server_status() -> ServerStatus:
+    """Gather information about running servers, tunnels, and LAN IP."""
+
+    main_running, alt_running = await asyncio.gather(
+        _is_server_running(MINECRAFT_SCRIPT),
+        _is_server_running(MINECRAFT_ALT_SCRIPT),
+    )
+
+    ngrok_urls = await _get_ngrok_tunnels()
+    lan_ip = await _get_lan_ip()
+
+    return ServerStatus(
+        main_running=main_running,
+        alt_running=alt_running,
+        ngrok_urls=ngrok_urls,
+        lan_ip=lan_ip,
+    )
+
+
+async def _get_ngrok_tunnels() -> List[str]:
+    """Return the active ngrok public URLs if the local API is reachable."""
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "http://127.0.0.1:4040/api/tunnels", timeout=5
+            ) as response:
+                if response.status != 200:
+                    return []
+
+                data = await response.json()
+    except aiohttp.ClientError:  # pragma: no cover - network failure path
+        return []
+
+    tunnels = data.get("tunnels", [])
+    return [tunnel.get("public_url", "") for tunnel in tunnels if tunnel.get("public_url")]
+
+
+async def _get_lan_ip() -> Optional[str]:
+    """Resolve the LAN IP address without blocking the event loop."""
+
+    return await asyncio.to_thread(_determine_lan_ip)
+
+
+def _determine_lan_ip() -> Optional[str]:
+    """Return the LAN IP by opening a dummy socket connection."""
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except OSError:  # pragma: no cover - network failure path
+        return None
+
+
+def _format_server_status(status: ServerStatus) -> str:
+    """Format a Discord-ready status message for server information."""
+
+    main_line = (
+        "✅ Main server is running"
+        if status.main_running
+        else "⛔ Main server is stopped"
+    )
+    alt_line = (
+        "✅ Alt server is running"
+        if status.alt_running
+        else "⛔ Alt server is stopped"
+    )
+
+    lines = [
+        "**Minecraft Server Status**",
+        f"{main_line} (`{MINECRAFT_SCRIPT}`)",
+        f"{alt_line} (`{MINECRAFT_ALT_SCRIPT}`)",
+    ]
+
+    if status.ngrok_urls:
+        lines.append("Ngrok tunnels: " + ", ".join(status.ngrok_urls))
+    else:
+        lines.append("Ngrok tunnels: none detected.")
+
+    if status.lan_ip:
+        lines.append(f"LAN address: {status.lan_ip}:{MINECRAFT_PORT}")
+    else:
+        lines.append("LAN address: unavailable.")
+
+    return "\n".join(lines)
+
+
+def _parse_stopserver_target(message_content: str, command: str) -> str:
+    """Determine which server the stop command should target."""
+
+    remainder = message_content[len(command) :].strip()
+
+    if not remainder:
+        return "auto"
+
+    lowered = remainder.lower()
+    if lowered.startswith("main") or "primary" in lowered:
+        return "main"
+
+    if lowered.startswith("alt") or "opticraft" in lowered:
+        return "alt"
+
+    return "auto"
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry
     main()
