@@ -19,7 +19,7 @@ from typing import Deque, Dict, List, Optional, Sequence
 
 import aiohttp
 import discord
-from discord import Message
+from discord import Message, TextChannel
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -52,6 +52,8 @@ STOP_SERVER_COMMAND = os.getenv("STOP_SERVER_COMMAND", "..stopserver")
 MINECRAFT_PORT = os.getenv("MINECRAFT_PORT", "25565")
 MAX_DISCORD_MESSAGE = 1900
 MAX_HISTORY = 6
+
+MINECRAFT_LOG_CHANNEL_ID = os.getenv("MINECRAFT_LOG_CHANNEL_ID")
 
 SYSTEM_PROMPT = (
     "You are Rufus, an upbeat surf coach turned AI companion. You respond with "
@@ -140,6 +142,10 @@ class RufusBot(discord.Client):
     async def setup_hook(self) -> None:
         """Configure Discord logging bridge and startup note."""
         _logger.info("Rufus bot starting up")
+        _logger.info(
+            "Command overview: %s",
+            _summarize_commands_for_log(self._command_descriptions),
+        )
 
         # Optional Discord logging: attach a queue + handler
         if DISCORD_LOG_CHANNEL_ID is not None:
