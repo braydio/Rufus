@@ -1,25 +1,30 @@
 """Discord bot entry point for the Rufus project.
 
 This module hosts a minimal Discord client that forwards prompts to an AI
-completion endpoint while speaking with an upbeat personality.  The focus is on
+completion endpoint while speaking with an upbeat personality. The focus is on
 maintainability and clarity rather than feature bloat.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shlex
 import socket
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, List, Mapping, Optional, Sequence
+from typing import Deque, Dict, List, Optional, Sequence
 
 import aiohttp
 import discord
 from discord import Message, TextChannel
 from dotenv import load_dotenv
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
 
 load_dotenv()
 
@@ -27,6 +32,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_URL = os.getenv("API_URL", "http://localhost:5051/v1/chat/completions")
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "..ai")
 MINECRAFT_COMMAND = os.getenv("MINECRAFT_COMMAND", "..startmc")
+DISCORD_LOG_CHANNEL_ID = os.getenv(
+    "DISCORD_LOG_CHANNEL_ID",
+)
 MINECRAFT_SCRIPT = os.path.expanduser(
     os.getenv(
         "MINECRAFT_SCRIPT",
@@ -41,7 +49,6 @@ MINECRAFT_ALT_SCRIPT = os.path.expanduser(
 )
 SERVER_STATUS_COMMAND = os.getenv("SERVER_STATUS_COMMAND", "..serverstatus")
 STOP_SERVER_COMMAND = os.getenv("STOP_SERVER_COMMAND", "..stopserver")
-HELP_COMMAND = os.getenv("HELP_COMMAND", "..mchelp")
 MINECRAFT_PORT = os.getenv("MINECRAFT_PORT", "25565")
 MAX_DISCORD_MESSAGE = 1900
 MAX_HISTORY = 6
@@ -53,24 +60,24 @@ SYSTEM_PROMPT = (
     "encouragement, helpful details, and beachy enthusiasm without going overboard."
 )
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
 _logger = logging.getLogger("rufus.bot")
 
 
+# ---------------------------------------------------------------------------
+# OpenAI-compatible completion
+# ---------------------------------------------------------------------------
+
+
 async def request_completion(messages: List[Dict[str, str]]) -> str:
-    """Call the configured completion API and return the assistant's text.
-
-    Args:
-        messages: The chat history formatted according to the OpenAI-compatible
-            schema.
-
-    Returns:
-        The assistant message content returned by the API.
-
-    Raises:
-        RuntimeError: If the API returns a non-success status code or lacks a
-            usable response body.
-    """
-
+    """Call the configured completion API and return the assistant's text."""
     payload = {
         "model": os.getenv("MODEL", "gpt-4o-mini"),
         "messages": messages,
@@ -83,13 +90,42 @@ async def request_completion(messages: List[Dict[str, str]]) -> str:
             if response.status != 200:
                 text = await response.text()
                 raise RuntimeError(f"API error {response.status}: {text}")
-
             data = await response.json()
 
     try:
         return data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError, AttributeError) as exc:  # pragma: no cover - defensive
+    except (KeyError, IndexError, AttributeError) as exc:
         raise RuntimeError("API response missing choices/message content") from exc
+
+
+# ---------------------------------------------------------------------------
+# Discord log piping (optional)
+# ---------------------------------------------------------------------------
+
+
+class DiscordQueueHandler(logging.Handler):
+    """Logging handler that pushes formatted records into RufusBot's queue."""
+
+    def __init__(self, bot: "RufusBot", level=logging.INFO) -> None:
+        super().__init__(level=level)
+        self.bot = bot
+        self.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            if getattr(self.bot, "_log_queue", None) is not None:
+                self.bot._log_queue.put_nowait(msg)
+        except Exception:
+            # Never let logging explode
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Bot
+# ---------------------------------------------------------------------------
 
 
 class RufusBot(discord.Client):
@@ -100,42 +136,75 @@ class RufusBot(discord.Client):
         intents.message_content = True
         super().__init__(intents=intents)
         self._channel_histories: Dict[int, Deque[Dict[str, str]]] = {}
-        self._log_channel_id: Optional[int] = _parse_int(MINECRAFT_LOG_CHANNEL_ID)
-        self._log_channel: Optional[TextChannel] = None
-        self._command_descriptions: Dict[str, str] = _build_command_descriptions()
-        self._help_message: str = _format_help_message(self._command_descriptions)
+        self._log_queue: Optional[asyncio.Queue[str]] = None
+        self._log_worker_task: Optional[asyncio.Task] = None
 
     async def setup_hook(self) -> None:
-        """Configure logging once the client loop is ready."""
-
-        logging.basicConfig(level=logging.INFO)
+        """Configure Discord logging bridge and startup note."""
         _logger.info("Rufus bot starting up")
         _logger.info(
             "Command overview: %s",
             _summarize_commands_for_log(self._command_descriptions),
         )
 
-    async def on_ready(self) -> None:  # pragma: no cover - Discord callback
+        # Optional Discord logging: attach a queue + handler
+        if DISCORD_LOG_CHANNEL_ID is not None:
+            self._log_queue = asyncio.Queue()
+            handler = DiscordQueueHandler(self)
+            logging.getLogger().addHandler(handler)  # root
+            logging.getLogger("rufus.bot").addHandler(handler)  # local
+            self._log_worker_task = asyncio.create_task(self._discord_log_worker())
+            _logger.info("Discord log channel enabled: %s", DISCORD_LOG_CHANNEL_ID)
+        else:
+            _logger.info("Discord log channel not configured; console-only logs.")
+
+    async def _discord_log_worker(self) -> None:
+        """Background task that forwards log lines to the configured Discord channel."""
+        if self._log_queue is None:
+            return
+        # Wait until the bot is fully ready
+        await self.wait_until_ready()
+        channel = None
+        if DISCORD_LOG_CHANNEL_ID is not None:
+            channel = self.get_channel(DISCORD_LOG_CHANNEL_ID)
+            if channel is None:
+                # Try fetching if not cached
+                try:
+                    channel = await self.fetch_channel(DISCORD_LOG_CHANNEL_ID)
+                except Exception as e:
+                    _logger.warning("Unable to fetch Discord log channel: %s", e)
+
+        # Drain queue and post; if channel missing, just drop quietly
+        while not self.is_closed():
+            try:
+                msg = await self._log_queue.get()
+                if channel:
+                    # Chunk long messages
+                    for chunk in _chunk_message(msg):
+                        try:
+                            await channel.send(f"```{chunk}```")
+                        except Exception:
+                            # Avoid tight failure loops
+                            await asyncio.sleep(1.0)
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(0.5)
+
+    async def on_ready(self) -> None:
         _logger.info("Logged in as %s", self.user)
-
-        if self._log_channel_id is not None:
-            channel = self.get_channel(self._log_channel_id)
-            if isinstance(channel, TextChannel):
-                self._log_channel = channel
-                _logger.info(
-                    "Minecraft log channel configured: #%s (%s)",
-                    channel.name,
-                    channel.id,
-                )
+        # Startup tunnel visibility
+        try:
+            tunnel = await _get_ngrok_tunnel()
+            if tunnel:
+                _logger.info("Existing ngrok tunnel detected at startup: %s", tunnel)
             else:
-                _logger.warning(
-                    "Minecraft log channel %s not found or not a text channel.",
-                    self._log_channel_id,
-                )
+                _logger.info("No ngrok tunnel active at startup.")
+        except Exception as e:
+            _logger.warning("Could not query ngrok on startup: %s", e)
 
-        _logger.info("Rufus is ready to ride! Use %s for AI chat or %s for help.", COMMAND_PREFIX, HELP_COMMAND)
-
-    async def on_message(self, message: Message) -> None:  # pragma: no cover - Discord callback
+    async def on_message(self, message: Message) -> None:
         if message.author == self.user:
             return
 
@@ -151,10 +220,6 @@ class RufusBot(discord.Client):
             await self._handle_stop_server(message)
             return
 
-        if message.content.startswith(HELP_COMMAND):
-            await message.channel.send(self._help_message)
-            return
-
         if not message.content.startswith(COMMAND_PREFIX):
             return
 
@@ -165,8 +230,12 @@ class RufusBot(discord.Client):
             )
             return
 
-        history = self._channel_histories.setdefault(message.channel.id, deque(maxlen=MAX_HISTORY))
-        history.append({"role": "user", "content": f"{message.author.display_name}: {user_prompt}"})
+        history = self._channel_histories.setdefault(
+            message.channel.id, deque(maxlen=MAX_HISTORY)
+        )
+        history.append(
+            {"role": "user", "content": f"{message.author.display_name}: {user_prompt}"}
+        )
 
         chat_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         chat_messages.extend(history)
@@ -174,7 +243,7 @@ class RufusBot(discord.Client):
         async with message.channel.typing():
             try:
                 reply = await request_completion(chat_messages)
-            except Exception as exc:  # pragma: no cover - network failure path
+            except Exception:
                 _logger.exception("Failed to fetch completion")
                 await message.channel.send(
                     "Gnarly wipeout talking to the AI. Give it another shot in a moment!"
@@ -185,14 +254,14 @@ class RufusBot(discord.Client):
         for chunk in _chunk_message(reply):
             await message.channel.send(chunk)
 
-
     async def _handle_minecraft_launch(self, message: Message) -> None:
         """Launch the main Minecraft server, shutting down the alt server if needed."""
 
         await message.channel.send(
-            "Waxing the board and starting the Minecraft server... hang tight! 🏄"
+            "Waxing the board and firing up the Minecraft server... 🏄"
         )
 
+        # Duplicate-launch guard
         try:
             alt_running = await _is_server_running(MINECRAFT_ALT_SCRIPT)
         except Exception as exc:  # pragma: no cover - system-level failure path
@@ -224,8 +293,19 @@ class RufusBot(discord.Client):
             await _launch_minecraft_server(MINECRAFT_SCRIPT)
         except Exception as exc:  # pragma: no cover - system-level failure path
             _logger.exception("Minecraft server launch failed")
+            await message.channel.send(f"Server launch error: `{exc}`")
+            return
+
+        # Ensure ngrok tunnel
+        try:
+            tunnel_url = await _ensure_ngrok_tunnel()
             await message.channel.send(
-                f"The server launch bailed with an error: `{exc}`."
+                f"🌍 **Minecraft tunnel active!**\n`{_format_tunnel_address(tunnel_url)}`"
+            )
+        except Exception as exc:
+            _logger.exception("ngrok tunnel setup failed")
+            await message.channel.send(
+                f"Server launched but ngrok failed to initialize: `{exc}`"
             )
             return
 
@@ -281,21 +361,178 @@ class RufusBot(discord.Client):
             )
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
 def _chunk_message(text: str) -> List[str]:
     """Split a long response into Discord-safe chunks."""
-
     if not text:
         return ["Rufus is momentarily speechless, try again! 🤔"]
-
     return [
         text[i : i + MAX_DISCORD_MESSAGE]
         for i in range(0, len(text), MAX_DISCORD_MESSAGE)
     ]
 
 
-def main() -> None:  # pragma: no cover - CLI entry
-    """Entrypoint for running the Discord bot from the command line."""
+def _format_tunnel_address(url: str) -> str:
+    # ngrok returns tcp://host:port – Discord users only need host:port
+    return url.replace("tcp://", "").strip()
 
+
+async def _is_minecraft_running() -> bool:
+    """Best-effort process check to prevent duplicate launches."""
+    proc = await asyncio.create_subprocess_exec(
+        "pgrep",
+        "-f",
+        MINECRAFT_PGREP,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    running = bool(stdout.strip())
+    _logger.info("Minecraft running: %s", running)
+    return running
+
+
+async def _launch_minecraft_server() -> None:
+    """Launch the Minecraft server with detailed logging and correct working directory."""
+    mc_dir = os.path.dirname(MINECRAFT_SCRIPT)
+
+    if not os.path.exists(MINECRAFT_SCRIPT):
+        _logger.error("Launch script missing: %s", MINECRAFT_SCRIPT)
+        raise RuntimeError(f"Launch script not found at {MINECRAFT_SCRIPT}")
+
+    _logger.info("Launching Minecraft from directory: %s", mc_dir)
+
+    # Log file for stdout/stderr
+    log_path = os.path.join(mc_dir, "rufus_launch.log")
+    command = "nohup ./run.sh >> rufus_launch.log 2>&1 &"
+
+    _logger.debug("Full launch command: %s", command)
+
+    process = await asyncio.create_subprocess_exec(
+        "/bin/bash",
+        "-c",
+        command,
+        cwd=mc_dir,  # Run in the Minecraft directory (fixes @user_jvm_args.txt resolution)
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    _logger.info("Subprocess started (PID %s)", process.pid)
+    stderr_data = await process.stderr.read()
+    return_code = await process.wait()
+
+    if return_code != 0:
+        stderr_text = stderr_data.decode().strip() or "Unknown error"
+        _logger.error("Server launch failed (code %s): %s", return_code, stderr_text)
+        raise RuntimeError(stderr_text)
+
+    _logger.info("Server launch successful; output logged to %s", log_path)
+
+
+# ------------------------ ngrok management ------------------------
+
+
+async def _get_ngrok_tunnel() -> Optional[str]:
+    """Return the public TCP address from an active ngrok tunnel, or None if not found."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(NGROK_API_URL, timeout=5) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+        for tunnel in data.get("tunnels", []):
+            if tunnel.get("proto") == "tcp":
+                return tunnel.get("public_url")
+        return None
+    except Exception as e:
+        _logger.debug("ngrok API check failed: %s", e)
+        return None
+
+
+def _save_tunnel_cache(url: str) -> None:
+    try:
+        with open(NGROK_CACHE_PATH, "w") as f:
+            json.dump({"url": url}, f)
+    except Exception as e:
+        _logger.debug("Failed to write ngrok cache: %s", e)
+
+
+def _load_tunnel_cache() -> Optional[str]:
+    try:
+        if not os.path.exists(NGROK_CACHE_PATH):
+            return None
+        with open(NGROK_CACHE_PATH) as f:
+            data = json.load(f)
+        return data.get("url")
+    except Exception as e:
+        _logger.debug("Failed to read ngrok cache: %s", e)
+        return None
+
+
+async def _ensure_ngrok_tunnel() -> str:
+    """Ensure ngrok is running and return its public TCP URL."""
+    # If a tunnel exists, reuse it.
+    existing = await _get_ngrok_tunnel()
+    if existing:
+        _logger.info("Existing ngrok tunnel found: %s", existing)
+        _save_tunnel_cache(existing)
+        return existing
+
+    # Check for ngrok process anyway; if running but no tunnel, it'll likely be a stale session
+    proc_check = await asyncio.create_subprocess_exec(
+        "pgrep",
+        "-x",
+        "ngrok",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc_check.communicate()
+    running = bool(stdout.strip())
+    _logger.info("ngrok process running: %s", running)
+
+    # Start a new tunnel if none detected
+    if not running:
+        _logger.info("Starting new ngrok tunnel for port 25565...")
+        process = await asyncio.create_subprocess_exec(
+            *NGROK_CMD,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        _logger.info("ngrok started (PID %s)", process.pid)
+
+    # Give ngrok API a few seconds to come online (retry loop)
+    tunnel_url = None
+    for _ in range(12):  # up to ~12 seconds
+        await asyncio.sleep(1)
+        tunnel_url = await _get_ngrok_tunnel()
+        if tunnel_url:
+            break
+
+    if not tunnel_url:
+        # As a last resort, if we have a cached value, surface it (may be stale)
+        cached = _load_tunnel_cache()
+        if cached:
+            _logger.warning(
+                "Using cached ngrok URL (live tunnel not confirmed): %s", cached
+            )
+            return cached
+        raise RuntimeError("ngrok started, but no tunnel found in API response")
+
+    _logger.info("New ngrok tunnel ready: %s", tunnel_url)
+    _save_tunnel_cache(tunnel_url)
+    return tunnel_url
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not configured in the environment")
 
@@ -317,9 +554,7 @@ async def _launch_minecraft_server(script_path: str) -> None:
     """Spawn the provided Minecraft server script in the background."""
 
     if not os.path.exists(script_path):
-        raise RuntimeError(
-            f"Launch script not found at {script_path}."
-        )
+        raise RuntimeError(f"Launch script not found at {script_path}.")
 
     command = f"nohup {shlex.quote(script_path)} >/dev/null 2>&1 &"
 
@@ -418,7 +653,9 @@ async def _get_ngrok_tunnels() -> List[str]:
         return []
 
     tunnels = data.get("tunnels", [])
-    return [tunnel.get("public_url", "") for tunnel in tunnels if tunnel.get("public_url")]
+    return [
+        tunnel.get("public_url", "") for tunnel in tunnels if tunnel.get("public_url")
+    ]
 
 
 async def _get_lan_ip() -> Optional[str]:
@@ -447,9 +684,7 @@ def _format_server_status(status: ServerStatus) -> str:
         else "⛔ Main server is stopped"
     )
     alt_line = (
-        "✅ Alt server is running"
-        if status.alt_running
-        else "⛔ Alt server is stopped"
+        "✅ Alt server is running" if status.alt_running else "⛔ Alt server is stopped"
     )
 
     lines = [
@@ -471,55 +706,6 @@ def _format_server_status(status: ServerStatus) -> str:
     return "\n".join(lines)
 
 
-def _build_command_descriptions() -> Dict[str, str]:
-    """Return a mapping describing Rufus' public bot commands."""
-
-    return {
-        f"{COMMAND_PREFIX} <message>": "Chat with Rufus' AI brain.",
-        MINECRAFT_COMMAND: "Start the main Minecraft server (stops the alt server first).",
-        f"{STOP_SERVER_COMMAND} [main|alt]": "Stop the requested Minecraft server (auto-detect by default).",
-        SERVER_STATUS_COMMAND: "Show which servers are running plus tunnel and LAN info.",
-        HELP_COMMAND: "Display this help overview.",
-    }
-
-
-def _format_help_message(command_descriptions: Mapping[str, str]) -> str:
-    """Create a Discord-friendly help message for the available commands."""
-
-    lines = [
-        "**Rufus Command Guide**",
-        "Rufus keeps the vibes high while helping with AI chats and Minecraft servers.",
-        "",
-    ]
-
-    for command, description in command_descriptions.items():
-        lines.append(f"• `{command}` — {description}")
-
-    lines.append("")
-    lines.append("Only actual Minecraft server log lines are sent to the dedicated log channel.")
-    return "\n".join(lines)
-
-
-def _summarize_commands_for_log(command_descriptions: Mapping[str, str]) -> str:
-    """Return a compact one-line summary of commands for startup logging."""
-
-    parts = [f"{cmd}: {desc}" for cmd, desc in command_descriptions.items()]
-    return " | ".join(parts)
-
-
-def _parse_int(value: Optional[str]) -> Optional[int]:
-    """Attempt to parse an integer from a string value."""
-
-    if value is None:
-        return None
-
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        _logger.warning("Invalid integer value provided: %s", value)
-        return None
-
-
 def _parse_stopserver_target(message_content: str, command: str) -> str:
     """Determine which server the stop command should target."""
 
@@ -536,6 +722,7 @@ def _parse_stopserver_target(message_content: str, command: str) -> str:
         return "alt"
 
     return "auto"
+
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry
     main()

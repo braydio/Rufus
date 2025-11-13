@@ -10,8 +10,6 @@ from main import (
     MINECRAFT_SCRIPT,
     ServerStatus,
     _format_server_status,
-    _format_help_message,
-    _build_command_descriptions,
     _parse_stopserver_target,
 )
 
@@ -83,22 +81,6 @@ class StopServerParsingTests(unittest.TestCase):
             _parse_stopserver_target("..stopserver somethingelse", "..stopserver"),
             "auto",
         )
-
-
-class HelpFormattingTests(unittest.TestCase):
-    """Validate the structure of the Discord help message."""
-
-    def test_help_lists_each_command(self) -> None:
-        """The help message should mention every configured command."""
-
-        descriptions = _build_command_descriptions()
-        help_message = _format_help_message(descriptions)
-
-        for command in descriptions:
-            self.assertIn(command, help_message)
-            self.assertIn(descriptions[command], help_message)
-
-        self.assertIn("Command Guide", help_message)
 
 
 if __name__ == "__main__":
