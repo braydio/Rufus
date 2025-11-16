@@ -18,9 +18,32 @@ from dataclasses import dataclass
 from typing import Deque, Dict, List, Optional, Sequence
 
 import aiohttp
-import discord
-from discord import Message, TextChannel
-from dotenv import load_dotenv
+
+# Optional imports for testability: allow running unit tests without discord/dotenv installed
+DISCORD_AVAILABLE = True
+try:
+    import discord
+    from discord import Message
+except Exception:  # pragma: no cover - allows tests without discord installed
+    DISCORD_AVAILABLE = False
+
+    class _DiscordClientStub:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class _DiscordStub:
+        Client = _DiscordClientStub
+
+    discord = _DiscordStub()  # type: ignore
+
+    class Message:  # minimal placeholder for type hints
+        ...
+
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - allow running tests without python-dotenv
+    def load_dotenv() -> None:  # type: ignore
+        return None
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -52,6 +75,28 @@ STOP_SERVER_COMMAND = os.getenv("STOP_SERVER_COMMAND", "..stopserver")
 MINECRAFT_PORT = os.getenv("MINECRAFT_PORT", "25565")
 MAX_DISCORD_MESSAGE = 1900
 MAX_HISTORY = 6
+
+# Process-match pattern for pgrep when checking if Minecraft is running
+MINECRAFT_PGREP = os.getenv(
+    "MINECRAFT_PGREP",
+    os.path.basename(MINECRAFT_SCRIPT) if MINECRAFT_SCRIPT else "java",
+)
+
+# ngrok configuration (defaults to TCP tunnel on the Minecraft port)
+NGROK_BIN = os.getenv("NGROK_BIN", "ngrok")
+NGROK_API_URL = os.getenv("NGROK_API_URL", "http://127.0.0.1:4040/api/tunnels")
+NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN")
+NGROK_REGION = os.getenv("NGROK_REGION")
+NGROK_CACHE_PATH = os.path.expanduser(
+    os.getenv("NGROK_CACHE_PATH", "~/.cache/rufus/ngrok.json")
+)
+
+# Build the ngrok command to expose the Minecraft port via TCP
+NGROK_CMD = [NGROK_BIN, "tcp", str(MINECRAFT_PORT)]
+if NGROK_AUTHTOKEN:
+    NGROK_CMD += ["--authtoken", NGROK_AUTHTOKEN]
+if NGROK_REGION:
+    NGROK_CMD += ["--region", NGROK_REGION]
 
 MINECRAFT_LOG_CHANNEL_ID = os.getenv("MINECRAFT_LOG_CHANNEL_ID")
 
@@ -533,6 +578,11 @@ async def _ensure_ngrok_tunnel() -> str:
 
 
 def main() -> None:
+    if not DISCORD_AVAILABLE:
+        raise RuntimeError(
+            "discord.py is not installed. Install with `pip install discord.py` to run the bot."
+        )
+
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not configured in the environment")
 
