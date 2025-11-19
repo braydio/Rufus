@@ -189,7 +189,17 @@ class RufusBot(discord.Client):
         _logger.info("Rufus bot starting up")
         _logger.info(
             "Command overview: %s",
-            _summarize_commands_for_log(self._command_descriptions),
+    (
+        "No commands registered."
+        if not getattr(self, "_command_descriptions", None)
+        else "; ".join(
+            f"{name}: {description}"
+            for name, description in sorted(
+                getattr(self, "_command_descriptions", {}).items(),
+                key=lambda pair: str(pair[0]),
+            )
+        )
+    ),
         )
 
         # Optional Discord logging: attach a queue + handler
@@ -776,3 +786,19 @@ def _parse_stopserver_target(message_content: str, command: str) -> str:
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry
     main()
+def _summarize_commands_for_log(command_descriptions):
+    """
+    Build a short, stable string summary of the bot commands
+    suitable for logging at startup.
+    """
+    if not command_descriptions:
+        return "No commands registered."
+
+    try:
+        items = command_descriptions.items()
+    except AttributeError:
+        # Fallback if an iterable of pairs is passed instead of a mapping.
+        items = command_descriptions
+
+    parts = [f"{name}: {description}" for name, description in sorted(items, key=lambda pair: str(pair[0]))]
+    return "; ".join(parts)
