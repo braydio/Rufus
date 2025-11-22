@@ -1,0 +1,20 @@
+[Unit]
+Description=Rufus Discord bot (Minecraft server + tunnel helper)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Run Rufus as the local user so it can launch the Minecraft scripts and tunnels.
+User=braydenchaffee
+WorkingDirectory=/home/braydenchaffee/Production/RufusRobot
+EnvironmentFile=/home/braydenchaffee/Production/RufusRobot/.env
+Environment="PYTHONUNBUFFERED=1"
+# Prefer the project virtualenv for dependencies, fall back to system bins.
+Environment="PATH=/home/braydenchaffee/Production/RufusRobot/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+ExecStart=/home/braydenchaffee/Production/RufusRobot/.venv/bin/python /home/braydenchaffee/Production/RufusRobot/main.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

@@ -39,9 +39,11 @@ except Exception:  # pragma: no cover - allows tests without discord installed
     class Message:  # minimal placeholder for type hints
         ...
 
+
 try:
     from dotenv import load_dotenv
 except Exception:  # pragma: no cover - allow running tests without python-dotenv
+
     def load_dotenv() -> None:  # type: ignore
         return None
 
@@ -97,6 +99,19 @@ if NGROK_AUTHTOKEN:
     NGROK_CMD += ["--authtoken", NGROK_AUTHTOKEN]
 if NGROK_REGION:
     NGROK_CMD += ["--region", NGROK_REGION]
+
+# Cloudflared configuration
+CLOUDFLARED_BIN = os.getenv("CLOUDFLARED_BIN", "cloudflared")
+# Hostname players should connect to, e.g. "minecraft.example.com:25565"
+CLOUDFLARED_HOST = os.getenv("CLOUDFLARED_HOST")
+# Optional custom arguments for cloudflared, e.g. "tunnel --url tcp://127.0.0.1:25565"
+CLOUDFLARED_ARGS = shlex.split(os.getenv("CLOUDFLARED_ARGS", ""))
+
+# Comma-separated tunnel priority list, first provider wins. Example: "cloudflared,ngrok"
+_priority_raw = os.getenv("MINECRAFT_TUNNEL_PRIORITY", "cloudflared,ngrok")
+TUNNEL_PRIORITY = [p.strip().lower() for p in _priority_raw.split(",") if p.strip()]
+if not TUNNEL_PRIORITY:
+    TUNNEL_PRIORITY = ["ngrok", "ngrok"]
 
 MINECRAFT_LOG_CHANNEL_ID = os.getenv("MINECRAFT_LOG_CHANNEL_ID")
 
@@ -189,17 +204,17 @@ class RufusBot(discord.Client):
         _logger.info("Rufus bot starting up")
         _logger.info(
             "Command overview: %s",
-    (
-        "No commands registered."
-        if not getattr(self, "_command_descriptions", None)
-        else "; ".join(
-            f"{name}: {description}"
-            for name, description in sorted(
-                getattr(self, "_command_descriptions", {}).items(),
-                key=lambda pair: str(pair[0]),
-            )
-        )
-    ),
+            (
+                "No commands registered."
+                if not getattr(self, "_command_descriptions", None)
+                else "; ".join(
+                    f"{name}: {description}"
+                    for name, description in sorted(
+                        getattr(self, "_command_descriptions", {}).items(),
+                        key=lambda pair: str(pair[0]),
+                    )
+                )
+            ),
         )
 
         # Optional Discord logging: attach a queue + handler
@@ -251,9 +266,21 @@ class RufusBot(discord.Client):
         _logger.info("Logged in as %s", self.user)
         # Startup tunnel visibility
         try:
-            tunnel = await _get_ngrok_tunnel()
-            if tunnel:
-                _logger.info("Existing ngrok tunnel detected at startup: %s", tunnel)
+            cloudflared_url = await _get_cloudflared_url()
+            ngrok_tunnel = await _get_ngrok_tunnel()
+
+            if cloudflared_url:
+                _logger.info(
+                    "Existing Cloudflared tunnel detected at startup: %s",
+                    cloudflared_url,
+                )
+            else:
+                _logger.info("No Cloudflared tunnel active at startup.")
+
+            if ngrok_tunnel:
+                _logger.info(
+                    "Existing ngrok tunnel detected at startup: %s", ngrok_tunnel
+                )
             else:
                 _logger.info("No ngrok tunnel active at startup.")
         except Exception as e:
@@ -351,16 +378,18 @@ class RufusBot(discord.Client):
             await message.channel.send(f"Server launch error: `{exc}`")
             return
 
-        # Ensure ngrok tunnel
+        # Ensure tunnel according to configured provider priority
         try:
-            tunnel_url = await _ensure_ngrok_tunnel()
+            tunnel_url, provider = await _ensure_preferred_tunnel()
+            provider_name = "Cloudflared" if provider == "cloudflared" else "ngrok"
             await message.channel.send(
-                f"🌍 **Minecraft tunnel active!**\n`{_format_tunnel_address(tunnel_url)}`"
+                f"🌍 **Minecraft tunnel active via {provider_name}!**\n"
+                f"`{_format_tunnel_address(tunnel_url)}`"
             )
         except Exception as exc:
-            _logger.exception("ngrok tunnel setup failed")
+            _logger.exception("Tunnel setup failed")
             await message.channel.send(
-                f"Server launched but ngrok failed to initialize: `{exc}`"
+                f"Server launched but the tunnel failed to initialize: `{exc}`"
             )
             return
 
@@ -488,7 +517,7 @@ async def _launch_minecraft_server() -> None:
     _logger.info("Server launch successful; output logged to %s", log_path)
 
 
-# ------------------------ ngrok management ------------------------
+# ------------------------ tunnel management ------------------------
 
 
 async def _get_ngrok_tunnel() -> Optional[str]:
@@ -582,6 +611,108 @@ async def _ensure_ngrok_tunnel() -> str:
     return tunnel_url
 
 
+async def _is_process_running_exact(name: str) -> bool:
+    """Return True if a process with the exact name is running."""
+
+    proc_check = await asyncio.create_subprocess_exec(
+        "pgrep",
+        "-x",
+        name,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc_check.communicate()
+    return bool(stdout.strip())
+
+
+async def _get_cloudflared_url() -> Optional[str]:
+    """Return the configured Cloudflared host if the process appears to be running."""
+
+    if not CLOUDFLARED_HOST:
+        return None
+
+    if not await _is_process_running_exact("cloudflared"):
+        return None
+
+    return CLOUDFLARED_HOST
+
+
+async def _ensure_cloudflared_tunnel() -> str:
+    """Ensure Cloudflared is running and return the configured public host."""
+
+    if not CLOUDFLARED_HOST:
+        raise RuntimeError(
+            "CLOUDFLARED_HOST is not configured; set it to the hostname players should use."
+        )
+
+    # If a tunnel appears to be running, just reuse it.
+    existing = await _get_cloudflared_url()
+    if existing:
+        _logger.info("Existing Cloudflared tunnel found: %s", existing)
+        return existing
+
+    running = await _is_process_running_exact("cloudflared")
+    _logger.info("cloudflared process running: %s", running)
+
+    if not running:
+        _logger.info(
+            "Starting new Cloudflared tunnel for Minecraft port %s...", MINECRAFT_PORT
+        )
+
+        cmd: List[str] = [CLOUDFLARED_BIN]
+        if CLOUDFLARED_ARGS:
+            cmd += CLOUDFLARED_ARGS
+        else:
+            cmd += [
+                "tunnel",
+                "--url",
+                f"tcp://127.0.0.1:{MINECRAFT_PORT}",
+            ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        _logger.info("cloudflared started (PID %s)", process.pid)
+
+    # Give cloudflared a moment to come online
+    for _ in range(5):
+        await asyncio.sleep(1)
+        if await _is_process_running_exact("cloudflared"):
+            break
+
+    if not await _is_process_running_exact("cloudflared"):
+        raise RuntimeError("cloudflared started, but exited before becoming ready")
+
+    _logger.info("Cloudflared tunnel assumed ready at %s", CLOUDFLARED_HOST)
+    return CLOUDFLARED_HOST
+
+
+async def _ensure_preferred_tunnel() -> (str, str):
+    """Ensure a tunnel exists using the configured provider priority.
+
+    Returns:
+        Tuple of (public_address, provider_name).
+    """
+
+    last_error: Optional[Exception] = None
+
+    for provider in TUNNEL_PRIORITY:
+        try:
+            if provider == "cloudflared":
+                url = await _ensure_cloudflared_tunnel()
+                return url, "cloudflared"
+            if provider == "ngrok":
+                url = await _ensure_ngrok_tunnel()
+                return url, "ngrok"
+        except Exception as exc:  # pragma: no cover - provider failures are logged
+            last_error = exc
+            _logger.warning("Tunnel provider %s failed: %s", provider, exc)
+
+    raise RuntimeError(f"All tunnel providers failed. Last error: {last_error!r}")
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
@@ -608,6 +739,7 @@ class ServerStatus:
     alt_running: bool
     ngrok_urls: Sequence[str]
     lan_ip: Optional[str]
+    cloudflared_url: Optional[str] = None
 
 
 async def _launch_minecraft_server(script_path: str) -> None:
@@ -686,14 +818,18 @@ async def _collect_server_status() -> ServerStatus:
         _is_server_running(MINECRAFT_ALT_SCRIPT),
     )
 
-    ngrok_urls = await _get_ngrok_tunnels()
-    lan_ip = await _get_lan_ip()
+    cloudflared_url, ngrok_urls, lan_ip = await asyncio.gather(
+        _get_cloudflared_url(),
+        _get_ngrok_tunnels(),
+        _get_lan_ip(),
+    )
 
     return ServerStatus(
         main_running=main_running,
         alt_running=alt_running,
         ngrok_urls=ngrok_urls,
         lan_ip=lan_ip,
+        cloudflared_url=cloudflared_url,
     )
 
 
@@ -753,6 +889,11 @@ def _format_server_status(status: ServerStatus) -> str:
         f"{alt_line} (`{MINECRAFT_ALT_SCRIPT}`)",
     ]
 
+    if status.cloudflared_url:
+        lines.append(f"Cloudflared tunnel: {status.cloudflared_url}")
+    else:
+        lines.append("Cloudflared tunnel: none detected.")
+
     if status.ngrok_urls:
         lines.append("Ngrok tunnels: " + ", ".join(status.ngrok_urls))
     else:
@@ -786,6 +927,8 @@ def _parse_stopserver_target(message_content: str, command: str) -> str:
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry
     main()
+
+
 def _summarize_commands_for_log(command_descriptions):
     """
     Build a short, stable string summary of the bot commands
@@ -800,5 +943,8 @@ def _summarize_commands_for_log(command_descriptions):
         # Fallback if an iterable of pairs is passed instead of a mapping.
         items = command_descriptions
 
-    parts = [f"{name}: {description}" for name, description in sorted(items, key=lambda pair: str(pair[0]))]
+    parts = [
+        f"{name}: {description}"
+        for name, description in sorted(items, key=lambda pair: str(pair[0]))
+    ]
     return "; ".join(parts)

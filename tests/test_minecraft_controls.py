@@ -25,6 +25,7 @@ class FormatServerStatusTests(unittest.TestCase):
             alt_running=False,
             ngrok_urls=["https://example.ngrok.io"],
             lan_ip="192.168.1.23",
+            cloudflared_url="minecraft.example.com:25565",
         )
 
         result = _format_server_status(status)
@@ -35,6 +36,8 @@ class FormatServerStatusTests(unittest.TestCase):
         self.assertIn("https://example.ngrok.io", result)
         self.assertIn(f"{status.lan_ip}:{MINECRAFT_PORT}", result)
         self.assertIn("Ngrok tunnels", result)
+        self.assertIn("Cloudflared tunnel", result)
+        self.assertIn("minecraft.example.com:25565", result)
 
     def test_format_handles_missing_network_details(self) -> None:
         """When no tunnels or LAN IP exist the output calls that out explicitly."""
@@ -44,12 +47,14 @@ class FormatServerStatusTests(unittest.TestCase):
             alt_running=False,
             ngrok_urls=[],
             lan_ip=None,
+            cloudflared_url=None,
         )
 
         result = _format_server_status(status)
 
         self.assertIn("none detected", result)
         self.assertIn("unavailable", result)
+        self.assertIn("Cloudflared tunnel", result)
 
 
 class StopServerParsingTests(unittest.TestCase):
