@@ -69,7 +69,7 @@ MINECRAFT_SCRIPT = os.path.expanduser(
 MINECRAFT_ALT_SCRIPT = os.path.expanduser(
     os.getenv(
         "MINECRAFT_ALT_SCRIPT",
-        "/home/braydenchaffee/Media/Minecraft/Opticraft_VR/run.sh",
+        "/home/braydenchaffee/Media/Minecraft/OptiCraft_VR/run.sh",
     )
 )
 SERVER_STATUS_COMMAND = os.getenv("SERVER_STATUS_COMMAND", "..serverstatus")
